@@ -1,0 +1,29 @@
+[Unit]
+Description=JX AI Comment Reply Service - Auto reply to Meituan/Dianping reviews
+Documentation=https://github.com/Kewen526/jx_ai
+After=network.target mysql.service
+
+[Service]
+Type=simple
+User=user
+Group=user
+WorkingDirectory=/home/user/jx_ai
+ExecStart=/usr/bin/python3 /home/user/jx_ai/code
+Restart=always
+RestartSec=30
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+# Logging
+StandardOutput=append:/home/user/jx_ai/logs/output.log
+StandardError=append:/home/user/jx_ai/logs/error.log
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
