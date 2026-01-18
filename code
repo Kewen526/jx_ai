@@ -1,0 +1,483 @@
+# -*- coding: utf-8 -*-
+"""
+AI评论回复生成器
+- 从MySQL数据库读取未回复的美团/大众点评评论
+- 调用智谱AI生成商家回复
+- 将生成的回复写回数据库
+"""
+
+import asyncio
+import aiomysql
+import aiohttp
+import time
+import threading
+import logging
+from typing import Optional, List, Dict, Any
+from functools import wraps
+from dataclasses import dataclass
+
+# ============================================================
+# 日志配置
+# ============================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# 数据库配置
+# ============================================================
+DB_CONFIG = {
+    "host": "8.146.210.145",
+    "port": 3306,
+    "user": "root",
+    "password": "Kewen888@",
+    "db": "jx_data_info",
+    "charset": "utf8mb4",
+    "autocommit": True
+}
+
+# 表配置
+TABLES = {
+    "meituan": {
+        "name": "review_detail_meituan",
+        "has_product": True
+    },
+    "dianping": {
+        "name": "review_detail_dianping",
+        "has_product": False
+    }
+}
+
+# ============================================================
+# API配置
+# ============================================================
+ZHIPUAI_API_KEYS = [
+    "f31eaff26ee04560836b1d3ab92eacc8.oyPI18DOuSKebrna",
+    "69344382e19945a497697230f161c183.RAyvPnxU5docbnN7",
+    "fa5a8e68c93e405fa402df81124af0f9.64aRePpnl0sAjJsq",
+    "3f3b09e8aa524b069cdd2a589a76a261.OoeZfL1pzAWrKBEI",
+    "65f085e030e446309959fcdbdf7bb528.9TpxtScWIEiDXgVp",
+    "37a96354b4364d1199cd530198cd1506.SqjVbJcRyU2b31vE",
+    "131a657523954446932045ed7e3cebc2.tsiLEwwbw2TC4ImB",
+    "81b0ed0f1db74f278b7b7ccf7b77027c.8C18IDpwc0CkJJBO",
+]
+
+# 并发控制
+MAX_CONCURRENT = 3  # 最大并发数
+
+
+# ============================================================
+# 数据模型
+# ============================================================
+@dataclass
+class ReviewTask:
+    """评论任务"""
+    table_name: str
+    id: int
+    shop_name: str
+    star: int
+    content: str
+    product_name: str
+
+
+# ============================================================
+# API密钥管理器
+# ============================================================
+class APIKeyManager:
+    """API密钥管理器 - 处理黑名单和轮换"""
+
+    def __init__(self, blacklist_duration: int = 180):
+        self.blacklist_duration = blacklist_duration
+        self.blacklisted_keys = {}
+        self.last_used_index = -1
+        self.lock = threading.RLock()
+
+    def add_to_blacklist(self, api_key: str, reason: str = "限流"):
+        with self.lock:
+            end_time = time.time() + self.blacklist_duration
+            self.blacklisted_keys[api_key] = end_time
+            logger.warning(f"⚠️ 密钥加入黑名单({reason}): ...{api_key[-8:]} ({self.blacklist_duration}秒)")
+
+    def is_blacklisted(self, api_key: str) -> bool:
+        with self.lock:
+            if api_key not in self.blacklisted_keys:
+                return False
+            current_time = time.time()
+            if current_time >= self.blacklisted_keys[api_key]:
+                del self.blacklisted_keys[api_key]
+                logger.info(f"✅ 密钥黑名单过期恢复: ...{api_key[-8:]}")
+                return False
+            return True
+
+    def get_next_available_key(self, all_keys: List[str]) -> Optional[str]:
+        with self.lock:
+            if not all_keys:
+                return None
+            self._cleanup_expired()
+            available_keys = [key for key in all_keys if not self.is_blacklisted(key)]
+            if not available_keys:
+                logger.error(f"❌ 所有 {len(all_keys)} 个密钥都在黑名单中")
+                return None
+            self.last_used_index = (self.last_used_index + 1) % len(available_keys)
+            selected_key = available_keys[self.last_used_index]
+            return selected_key
+
+    def _cleanup_expired(self):
+        current_time = time.time()
+        expired = [k for k, t in self.blacklisted_keys.items() if current_time >= t]
+        for key in expired:
+            del self.blacklisted_keys[key]
+
+    def record_success(self, api_key: str):
+        pass  # 静默成功
+
+    def record_failure(self, api_key: str, error_msg: str):
+        error_lower = error_msg.lower()
+        is_rate_limit = any(keyword in error_lower for keyword in [
+            'rate limit', 'too many requests', '429', 'quota exceeded',
+            '1302', '并发数过高', 'concurrent', '限流', '请求过于频繁'
+        ])
+        if is_rate_limit:
+            self.add_to_blacklist(api_key, "限流")
+        else:
+            logger.warning(f"⚠️ 密钥调用失败: ...{api_key[-8:]}, 错误: {error_msg[:100]}")
+
+
+# 全局密钥管理器
+key_manager = APIKeyManager(blacklist_duration=180)
+
+
+# ============================================================
+# 指数退避重试装饰器
+# ============================================================
+def exponential_backoff_retry(max_retries: int = 10, base_wait: float = 2, max_wait: float = 60):
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    result = await func(*args, **kwargs)
+                    if isinstance(result, str) and '失败' in result:
+                        raise Exception(f"返回失败结果: {result}")
+                    return result
+                except Exception as e:
+                    attempt_num = attempt + 1
+                    logger.error(f"❌ 第{attempt_num}/{max_retries}次尝试失败: {str(e)[:200]}")
+                    if attempt == max_retries - 1:
+                        raise Exception(f"重试{max_retries}次后仍失败: {str(e)}")
+                    wait_time = min(base_wait * (2 ** attempt), max_wait)
+                    logger.warning(f"⏳ 等待{wait_time}秒后进行第{attempt_num + 1}次重试...")
+                    await asyncio.sleep(wait_time)
+            raise Exception(f"重试{max_retries}次后仍失败")
+        return wrapper
+    return decorator
+
+
+# ============================================================
+# Session管理器
+# ============================================================
+class SessionManager:
+    def __init__(self):
+        self._session = None
+        self._lock = asyncio.Lock()
+
+    async def get_session(self) -> aiohttp.ClientSession:
+        async with self._lock:
+            if self._session is None or self._session.closed:
+                timeout = aiohttp.ClientTimeout(total=120, connect=15)
+                connector = aiohttp.TCPConnector(limit=20, limit_per_host=10)
+                self._session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+            return self._session
+
+    async def close(self):
+        async with self._lock:
+            if self._session and not self._session.closed:
+                await self._session.close()
+
+
+# ============================================================
+# 提示词模板
+# ============================================================
+SYSTEM_PROMPT = "你是一位专业的美团/大众点评商家评论回复助手，负责为SPA/足道/养生店铺生成温馨、专业的客户评论回复"
+
+PROMPT_TEMPLATE = """
+你是一位专业的商家评论回复助手，负责为SPA/足道/养生店铺生成温馨、专业的客户评论回复。
+
+## 输入信息
+- 店铺名称：{shop_name}
+- 评论星级：{star}（1-5分，1-3为中差评，4-5为好评）
+- 客户评论内容：{content}（可能为"无"表示客户未写评论文字）
+- 客户购买的团购：{product_name}（可能为"无"表示未购买团购）
+
+## 回复规则
+
+### 1. 根据星级调整语气
+- **好评（4-5分）**：热情感谢，表达欣喜，肯定客户的选择
+- **中差评（1-3分）**：真诚致歉，表达重视，承诺改进
+
+### 2. 根据评论内容个性化回复
+- 如果客户提到了**技师编号**（如"11号"、"88号"），在回复中提及该技师并给予肯定
+- 如果客户提到了**具体体验**（如"手法好"、"环境干净"），在回复中呼应这些内容
+- 如果客户评论为"无"，使用通用的感谢/致歉话术
+
+### 3. 根据团购情况调整回复
+- 如果客户**购买了团购**，可在回复中提及："感谢您选购我们的{product_name}项目"
+- 如果客户**未购买团购**，不需要提及团购相关内容
+
+### 4. 回复结构
+**好评回复结构：**
+1. 称呼 + 感谢语
+2. 回应评论中的具体内容（如有）
+3. 店铺的服务理念/承诺
+4. 期待再次光临
+5. 推荐其他项目（如有）
+
+**中差评回复结构：**
+1. 称呼 + 致歉语
+2. 表达对客户反馈的重视
+3. 承诺改进
+4. 感谢反馈 + 期待给予再次机会
+
+### 5. 语言风格
+- 亲切温暖，避免过于官方
+- 称呼可用：亲爱的顾客、尊敬的客官、亲爱的小哥哥（男士SPA店可用）
+- 回复长度：100-200字为宜
+- 自然流畅，避免生硬的模板感
+
+## 输出要求
+直接输出回复内容，无需其他说明。
+"""
+
+
+# ============================================================
+# AI调用函数
+# ============================================================
+@exponential_backoff_retry(max_retries=10, base_wait=2, max_wait=60)
+async def call_zhipuai(
+        session_manager: SessionManager,
+        prompt: str,
+        system_prompt: str = None,
+        model: str = "glm-4-flash",
+        temperature: float = 0.1,
+        max_tokens: int = 4096
+) -> str:
+    """调用智谱AI"""
+    selected_key = key_manager.get_next_available_key(ZHIPUAI_API_KEYS)
+
+    if not selected_key:
+        logger.warning("⚠️ 所有密钥都在黑名单中，等待30秒...")
+        await asyncio.sleep(30)
+        selected_key = key_manager.get_next_available_key(ZHIPUAI_API_KEYS)
+        if not selected_key:
+            raise Exception("所有密钥都不可用")
+
+    try:
+        url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {selected_key}",
+            "Content-Type": "application/json"
+        }
+
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens
+        }
+
+        session = await session_manager.get_session()
+
+        async with session.post(url, headers=headers, json=payload, timeout=120) as response:
+            if response.status == 200:
+                result = await response.json()
+                if 'choices' in result and len(result['choices']) > 0:
+                    content = result['choices'][0]['message']['content']
+                    key_manager.record_success(selected_key)
+                    return content
+                else:
+                    raise Exception(f"响应格式错误: {result}")
+            else:
+                response_text = await response.text()
+                key_manager.record_failure(selected_key, f"HTTP {response.status}: {response_text}")
+                raise Exception(f"API调用失败: HTTP {response.status}")
+
+    except Exception as e:
+        key_manager.record_failure(selected_key, str(e))
+        raise
+
+
+# ============================================================
+# 数据库操作
+# ============================================================
+async def get_pending_reviews(pool: aiomysql.Pool) -> List[ReviewTask]:
+    """获取所有待处理的评论"""
+    tasks = []
+
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            # 查询美团表（有product_name）
+            meituan_sql = """
+                SELECT id, shop_name, star, content, product_name
+                FROM review_detail_meituan
+                WHERE shop_reply = '暂无回复' AND ai_gen IS NULL
+            """
+            await cursor.execute(meituan_sql)
+            meituan_rows = await cursor.fetchall()
+
+            for row in meituan_rows:
+                tasks.append(ReviewTask(
+                    table_name="review_detail_meituan",
+                    id=row['id'],
+                    shop_name=row['shop_name'] or "未知店铺",
+                    star=row['star'] or 5,
+                    content=row['content'] if row['content'] else "无",
+                    product_name=row['product_name'] if row['product_name'] else "无"
+                ))
+
+            logger.info(f"📋 美团表待处理: {len(meituan_rows)} 条")
+
+            # 查询大众点评表（无product_name）
+            dianping_sql = """
+                SELECT id, shop_name, star, content
+                FROM review_detail_dianping
+                WHERE shop_reply = '暂无回复' AND ai_gen IS NULL
+            """
+            await cursor.execute(dianping_sql)
+            dianping_rows = await cursor.fetchall()
+
+            for row in dianping_rows:
+                tasks.append(ReviewTask(
+                    table_name="review_detail_dianping",
+                    id=row['id'],
+                    shop_name=row['shop_name'] or "未知店铺",
+                    star=row['star'] or 5,
+                    content=row['content'] if row['content'] else "无",
+                    product_name="无"  # 点评表没有团购信息
+                ))
+
+            logger.info(f"📋 点评表待处理: {len(dianping_rows)} 条")
+
+    logger.info(f"📋 总计待处理: {len(tasks)} 条")
+    return tasks
+
+
+async def update_ai_reply(pool: aiomysql.Pool, table_name: str, record_id: int, ai_reply: str) -> bool:
+    """更新AI回复到数据库"""
+    try:
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                sql = f"UPDATE {table_name} SET ai_gen = %s WHERE id = %s"
+                await cursor.execute(sql, (ai_reply, record_id))
+                await conn.commit()
+                return True
+    except Exception as e:
+        logger.error(f"❌ 更新数据库失败 [{table_name}][{record_id}]: {e}")
+        return False
+
+
+# ============================================================
+# 任务处理
+# ============================================================
+async def process_single_task(
+        task: ReviewTask,
+        session_manager: SessionManager,
+        pool: aiomysql.Pool,
+        semaphore: asyncio.Semaphore
+) -> Dict[str, Any]:
+    """处理单个评论任务"""
+    async with semaphore:
+        task_id = f"[{task.table_name}][{task.id}]"
+
+        try:
+            # 构建提示词
+            prompt = PROMPT_TEMPLATE.format(
+                shop_name=task.shop_name,
+                star=task.star,
+                content=task.content,
+                product_name=task.product_name
+            )
+
+            # 调用AI
+            logger.info(f"🤖 处理中 {task_id} - {task.shop_name[:20]}...")
+            ai_reply = await call_zhipuai(
+                session_manager=session_manager,
+                prompt=prompt,
+                system_prompt=SYSTEM_PROMPT
+            )
+
+            # 写入数据库
+            success = await update_ai_reply(pool, task.table_name, task.id, ai_reply)
+
+            if success:
+                logger.info(f"✅ 完成 {task_id} - 回复长度: {len(ai_reply)}字")
+                return {"id": task.id, "table": task.table_name, "status": "success", "reply_length": len(ai_reply)}
+            else:
+                return {"id": task.id, "table": task.table_name, "status": "db_error"}
+
+        except Exception as e:
+            logger.error(f"❌ 失败 {task_id}: {str(e)[:100]}")
+            return {"id": task.id, "table": task.table_name, "status": "error", "error": str(e)[:200]}
+
+
+async def main():
+    """主函数"""
+    logger.info("=" * 60)
+    logger.info("🚀 AI评论回复生成器启动")
+    logger.info("=" * 60)
+
+    # 创建数据库连接池
+    pool = await aiomysql.create_pool(**DB_CONFIG, minsize=2, maxsize=10)
+    session_manager = SessionManager()
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+
+    try:
+        # 获取待处理任务
+        tasks = await get_pending_reviews(pool)
+
+        if not tasks:
+            logger.info("✅ 没有待处理的评论，退出")
+            return
+
+        # 并发处理所有任务
+        start_time = time.time()
+
+        results = await asyncio.gather(*[
+            process_single_task(task, session_manager, pool, semaphore)
+            for task in tasks
+        ])
+
+        # 统计结果
+        elapsed = time.time() - start_time
+        success_count = sum(1 for r in results if r['status'] == 'success')
+        error_count = sum(1 for r in results if r['status'] != 'success')
+
+        logger.info("=" * 60)
+        logger.info(f"🏁 处理完成!")
+        logger.info(f"   总计: {len(tasks)} 条")
+        logger.info(f"   成功: {success_count} 条")
+        logger.info(f"   失败: {error_count} 条")
+        logger.info(f"   耗时: {elapsed:.1f} 秒")
+        logger.info("=" * 60)
+
+        # 输出失败记录
+        if error_count > 0:
+            logger.warning("❌ 失败记录:")
+            for r in results:
+                if r['status'] != 'success':
+                    logger.warning(f"   - [{r['table']}][{r['id']}]: {r.get('error', r['status'])}")
+
+    finally:
+        await session_manager.close()
+        pool.close()
+        await pool.wait_closed()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
