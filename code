@@ -17,6 +17,13 @@ from functools import wraps
 from dataclasses import dataclass
 
 # ============================================================
+# 自定义异常
+# ============================================================
+class ContentFilterError(Exception):
+    """敏感词过滤异常 - 不需要重试"""
+    pass
+
+# ============================================================
 # 日志配置
 # ============================================================
 logging.basicConfig(
@@ -163,6 +170,9 @@ def exponential_backoff_retry(max_retries: int = 10, base_wait: float = 2, max_w
                     if isinstance(result, str) and '失败' in result:
                         raise Exception(f"返回失败结果: {result}")
                     return result
+                except ContentFilterError:
+                    # 敏感词错误不重试，直接抛出
+                    raise
                 except Exception as e:
                     attempt_num = attempt + 1
                     logger.error(f"❌ 第{attempt_num}/{max_retries}次尝试失败: {str(e)[:200]}")
@@ -356,8 +366,14 @@ async def call_zhipuai(
             else:
                 response_text = await response.text()
                 key_manager.record_failure(selected_key, f"HTTP {response.status}: {response_text}")
+                # 检测1301敏感词错误
+                if '"code":"1301"' in response_text or '"1301"' in response_text:
+                    logger.warning(f"⚠️ 检测到敏感词过滤(1301)，不再重试")
+                    raise ContentFilterError("内容包含敏感词，被过滤")
                 raise Exception(f"API调用失败: HTTP {response.status}")
 
+    except ContentFilterError:
+        raise
     except Exception as e:
         key_manager.record_failure(selected_key, str(e))
         raise
@@ -497,6 +513,16 @@ async def process_single_task(
             else:
                 return {"id": task.id, "table": task.table_name, "status": "db_error"}
 
+        except ContentFilterError:
+            # 敏感词错误，写入固定文本
+            logger.warning(f"⚠️ 敏感词 {task_id} - 写入固定提示")
+            fixed_reply = "包含敏感词，无法生成"
+            success = await update_ai_reply(pool, task.table_name, task.id, fixed_reply)
+            if success:
+                return {"id": task.id, "table": task.table_name, "status": "filtered", "reply_length": len(fixed_reply)}
+            else:
+                return {"id": task.id, "table": task.table_name, "status": "db_error"}
+
         except Exception as e:
             logger.error(f"❌ 失败 {task_id}: {str(e)[:100]}")
             return {"id": task.id, "table": task.table_name, "status": "error", "error": str(e)[:200]}
@@ -532,12 +558,14 @@ async def main():
         # 统计结果
         elapsed = time.time() - start_time
         success_count = sum(1 for r in results if r['status'] == 'success')
-        error_count = sum(1 for r in results if r['status'] != 'success')
+        filtered_count = sum(1 for r in results if r['status'] == 'filtered')
+        error_count = sum(1 for r in results if r['status'] not in ('success', 'filtered'))
 
         logger.info("=" * 60)
         logger.info(f"🏁 处理完成!")
         logger.info(f"   总计: {len(tasks)} 条")
         logger.info(f"   成功: {success_count} 条")
+        logger.info(f"   敏感词: {filtered_count} 条")
         logger.info(f"   失败: {error_count} 条")
         logger.info(f"   耗时: {elapsed:.1f} 秒")
         logger.info("=" * 60)
