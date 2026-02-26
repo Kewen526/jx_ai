@@ -374,7 +374,7 @@ async def get_pending_reviews(pool: aiomysql.Pool) -> List[ReviewTask]:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
             # 查询美团表（有product_name）
             meituan_sql = """
-                SELECT id, shop_id, shop_name, star, content, product_name
+                SELECT id, shop_id, shop_name, star_display, content, product_name
                 FROM review_detail_meituan
                 WHERE shop_reply = '暂无回复' AND ai_gen IS NULL
             """
@@ -387,7 +387,7 @@ async def get_pending_reviews(pool: aiomysql.Pool) -> List[ReviewTask]:
                     id=row['id'],
                     shop_id=str(row['shop_id']) if row.get('shop_id') else "",
                     shop_name=row['shop_name'] or "未知店铺",
-                    star=row['star'] or 5,
+                    star=int(row['star_display']) if row.get('star_display') else 5,
                     content=row['content'] if row['content'] else "无",
                     product_name=row['product_name'] if row['product_name'] else "无"
                 ))
@@ -396,7 +396,7 @@ async def get_pending_reviews(pool: aiomysql.Pool) -> List[ReviewTask]:
 
             # 查询大众点评表（无product_name）
             dianping_sql = """
-                SELECT id, shop_id, shop_name, star, content
+                SELECT id, shop_id, shop_name, star_display, content
                 FROM review_detail_dianping
                 WHERE shop_reply = '暂无回复' AND ai_gen IS NULL
             """
@@ -409,7 +409,7 @@ async def get_pending_reviews(pool: aiomysql.Pool) -> List[ReviewTask]:
                     id=row['id'],
                     shop_id=str(row['shop_id']) if row.get('shop_id') else "",
                     shop_name=row['shop_name'] or "未知店铺",
-                    star=row['star'] or 5,
+                    star=int(row['star_display']) if row.get('star_display') else 5,
                     content=row['content'] if row['content'] else "无",
                     product_name="无"  # 点评表没有团购信息
                 ))
