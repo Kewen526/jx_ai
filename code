@@ -10,6 +10,8 @@ import asyncio
 import aiomysql
 import aiohttp
 import time
+import json
+import re
 import threading
 import logging
 from typing import Optional, List, Dict, Any
@@ -232,6 +234,7 @@ PROMPT_TEMPLATE = """
 2. **禁止占位符**：回复中不得出现"XX"、"某某"、"[项目名]"、"{{{{xxx}}}}"等任何占位符或变量符号
 3. **禁止凭空推荐**：如果没有具体项目可推荐，不要使用"欢迎尝试我们的其他项目"等空泛话术
 4. **禁止条件句外露**：不得出现"如果您提到的..."、"如果您下次..."等条件引导句式
+5. **禁止示例泄漏**：以下示例仅供理解回复结构，严禁将示例中的具体技师编号、项目名称等复制到实际回复中
 
 ## 回复规则
 
@@ -245,6 +248,7 @@ PROMPT_TEMPLATE = """
 |---------------|-----------------|
 | 明确的技师编号 | 提及该技师并给予肯定 |
 | 未提及技师 | **完全不提技师，跳过此项** |
+| 提到"技师"但无编号 | 只说"技师"，绝不编造任何编号 |
 | 具体体验描述（如手法、环境） | 回应并肯定这些内容 |
 | 评论为"无"或无具体内容 | 使用通用感谢话术，不要编造细节 |
 
@@ -281,6 +285,7 @@ PROMPT_TEMPLATE = """
 生成回复后，检查以下项目：
 - [ ] 是否包含"XX"、"某某"、方括号、花括号？→ 有则删除整句
 - [ ] 是否提到了客户没有提到的技师编号？→ 有则删除整句
+- [ ] 回复中出现的技师编号是否能在客户评论原文中找到？→ 找不到则删除
 - [ ] 是否推荐了不存在的项目？→ 有则删除整句
 - [ ] 是否出现"如果您..."的条件句？→ 有则改写或删除
 
@@ -305,9 +310,82 @@ PROMPT_TEMPLATE = """
 输入：星级2分，评论"等了很久"，团购"足疗套餐"
 输出：亲爱的顾客，非常抱歉给您带来了不好的等待体验，我们深表歉意。您的反馈我们非常重视，已经在优化预约和排队流程，避免类似情况再次发生。感谢您的宝贵意见，真诚期待能有机会为您提供更好的服务体验。
 
+**示例4：客户提到技师但未提编号（⚠️ 反面对照，务必注意）**
+输入：星级5分，评论"技师手法很专业，服务态度很好"，团购"无"
+❌ 错误输出：亲爱的顾客，非常感谢您的五星好评和认可！您的满意是我们最大的动力。8号技师的专业手法和良好的服务态度，正是我们追求的目标。我们承诺，会继续为您提供优质服务，期待您的再次光临！ → 错误原因：客户未提任何技师编号，"8号"是从示例中泄漏的虚构内容
+✅ 正确输出：亲爱的顾客，非常感谢您的五星好评！很高兴技师的专业手法和服务态度得到了您的认可，这是对我们团队最大的鼓励。我们会继续保持高品质服务，期待您的再次光临，祝您生活愉快！ → 正确原因：只提"技师"而不编造编号，忠实于客户原文
+
 ## 输出要求
 
 直接输出回复内容，无需任何解释说明。
+"""
+
+
+# ============================================================
+# 质检审核提示词
+# ============================================================
+QC_SYSTEM_PROMPT = "你是一位严格的评论回复质检审核员，负责检查AI生成的商家评论回复是否存在虚构、泄漏、占位符等问题。你必须逐条核查，绝不放过任何违规内容。"
+
+QC_PROMPT_TEMPLATE = """
+你是一位严格的评论回复质检审核员。请根据客户评论原文，逐条审核AI生成的回复是否合规。
+
+## 输入信息
+- 店铺名称：{shop_name}
+- 评论星级：{star}
+- 客户评论内容：{content}
+- 客户购买的团购：{product_name}
+- AI生成的回复：{reply}
+
+## 审核检查项（逐条执行，每条必须给出判定）
+
+### 检查项1：技师编号虚构
+- 提取回复中出现的所有技师编号（如"8号技师"、"11号"等）
+- 逐一核对客户评论原文中是否明确出现该编号
+- 判定：原文中找不到 → ❌ 不合格
+
+### 检查项2：占位符残留
+- 检查回复中是否包含以下内容：
+  - "XX"、"某某"、"xxx"
+  - 方括号 [ ]、花括号 {{ }}、尖括号 < >
+  - 类似"[项目名]"、"{{{{技师}}}}"等模板变量
+- 判定：存在任何一项 → ❌ 不合格
+
+### 检查项3：凭空推荐项目
+- 检查回复中是否推荐了具体项目名称
+- 如果推荐了，核对该项目名称是否来源于{product_name}
+- 判定：推荐的项目不在输入信息中 → ❌ 不合格
+
+### 检查项4：条件句外露
+- 检查回复中是否出现以下句式：
+  - "如果您提到的..."、"如果您下次..."
+  - "若您..."、"假如..."
+  - 其他暴露AI推理过程的条件句
+- 判定：存在 → ❌ 不合格
+
+### 检查项5：星级语气匹配
+- 好评（4-5分）：回复语气应为感谢、欣喜
+- 中差评（1-3分）：回复语气应为致歉、重视、承诺改进
+- 判定：语气与星级不匹配 → ❌ 不合格
+
+### 检查项6：信息编造
+- 检查回复中是否提到了客户评论中完全没有出现的具体细节（如具体的服务项目、具体的环境描述、具体的体验感受等）
+- 注意：通用的服务承诺和祝福语不算编造
+- 判定：存在编造的具体细节 → ❌ 不合格
+
+### 检查项7：回复长度
+- 回复字数应在80-150字之间
+- 判定：超出范围过多（低于60字或超过180字） → ⚠️ 警告
+
+## 输出格式（严格按照以下JSON格式输出）
+
+{{"passed": true或false, "checks": [{{"id": 1, "name": "技师编号虚构", "result": "✅通过 或 ❌不合格", "detail": "说明"}}, {{"id": 2, "name": "占位符残留", "result": "✅通过 或 ❌不合格", "detail": "说明"}}, {{"id": 3, "name": "凭空推荐项目", "result": "✅通过 或 ❌不合格", "detail": "说明"}}, {{"id": 4, "name": "条件句外露", "result": "✅通过 或 ❌不合格", "detail": "说明"}}, {{"id": 5, "name": "星级语气匹配", "result": "✅通过 或 ❌不合格", "detail": "说明"}}, {{"id": 6, "name": "信息编造", "result": "✅通过 或 ❌不合格", "detail": "说明"}}, {{"id": 7, "name": "回复长度", "result": "✅通过 或 ⚠️警告", "detail": "实际X字"}}], "fixed_reply": "如果不合格，提供修正后的回复；如果合格，填null"}}
+
+## 审核原则
+
+1. 宁严勿松：有疑问的一律标记不合格
+2. 修正最小化：修正时只删除/改写违规部分，保留原回复中合格的内容和风格
+3. 修正后的回复必须通过所有检查项
+4. 直接输出JSON结果，无需其他解释
 """
 
 
@@ -319,7 +397,7 @@ async def call_zhipuai(
         session_manager: SessionManager,
         prompt: str,
         system_prompt: str = None,
-        model: str = "glm-4-flash",
+        model: str = "glm-4.7-flash",
         temperature: float = 0.1,
         max_tokens: int = 4096
 ) -> str:
@@ -370,6 +448,9 @@ async def call_zhipuai(
                 if '"code":"1301"' in response_text or '"1301"' in response_text:
                     logger.warning(f"⚠️ 检测到敏感词过滤(1301)，不再重试")
                     raise ContentFilterError("内容包含敏感词，被过滤")
+                # 429限流 - 抛出异常触发指数退避重试
+                if response.status == 429:
+                    logger.warning(f"⚠️ 429限流，将自动重试 (密钥: ...{selected_key[-8:]})")
                 raise Exception(f"API调用失败: HTTP {response.status}")
 
     except ContentFilterError:
@@ -377,6 +458,71 @@ async def call_zhipuai(
     except Exception as e:
         key_manager.record_failure(selected_key, str(e))
         raise
+
+
+# ============================================================
+# 质检审核函数
+# ============================================================
+async def check_reply_quality(
+        session_manager: SessionManager,
+        task: 'ReviewTask',
+        ai_reply: str
+) -> str:
+    """质检审核AI生成的回复，返回最终使用的回复"""
+    task_id = f"[{task.table_name}][{task.id}]"
+
+    try:
+        qc_prompt = QC_PROMPT_TEMPLATE.format(
+            shop_name=task.shop_name,
+            star=task.star,
+            content=task.content,
+            product_name=task.product_name,
+            reply=ai_reply
+        )
+
+        qc_response = await call_zhipuai(
+            session_manager=session_manager,
+            prompt=qc_prompt,
+            system_prompt=QC_SYSTEM_PROMPT,
+            temperature=0.1
+        )
+
+        # 尝试从响应中提取JSON（可能包含markdown代码块）
+        json_text = qc_response.strip()
+        # 去除可能的markdown代码块标记
+        json_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', json_text)
+        if json_match:
+            json_text = json_match.group(1)
+
+        qc_result = json.loads(json_text)
+
+        if qc_result.get("passed", True):
+            logger.info(f"✅ 质检通过 {task_id}")
+            return ai_reply
+        else:
+            # 质检不通过，记录不合格项
+            failed_checks = [
+                c for c in qc_result.get("checks", [])
+                if "❌" in c.get("result", "")
+            ]
+            failed_names = [c.get("name", "未知") for c in failed_checks]
+            logger.warning(f"⚠️ 质检不通过 {task_id}: {', '.join(failed_names)}")
+
+            # 使用修正后的回复
+            fixed_reply = qc_result.get("fixed_reply")
+            if fixed_reply and fixed_reply != "null" and isinstance(fixed_reply, str):
+                logger.info(f"🔧 使用质检修正回复 {task_id}")
+                return fixed_reply
+            else:
+                logger.warning(f"⚠️ 质检无修正回复，使用原回复 {task_id}")
+                return ai_reply
+
+    except json.JSONDecodeError as e:
+        logger.warning(f"⚠️ 质检JSON解析失败 {task_id}: {str(e)[:100]}，使用原回复")
+        return ai_reply
+    except Exception as e:
+        logger.warning(f"⚠️ 质检调用失败 {task_id}: {str(e)[:100]}，使用原回复")
+        return ai_reply
 
 
 # ============================================================
@@ -490,13 +636,17 @@ async def process_single_task(
                 product_name=task.product_name
             )
 
-            # 调用AI
+            # 调用AI生成回复
             logger.info(f"🤖 处理中 {task_id} - {task.shop_name[:20]}...")
             ai_reply = await call_zhipuai(
                 session_manager=session_manager,
                 prompt=prompt,
                 system_prompt=SYSTEM_PROMPT
             )
+
+            # 质检审核
+            logger.info(f"🔍 质检中 {task_id}...")
+            ai_reply = await check_reply_quality(session_manager, task, ai_reply)
 
             # 查询并拼接评价结尾
             review_ending = await get_review_ending(pool, task.shop_id)
